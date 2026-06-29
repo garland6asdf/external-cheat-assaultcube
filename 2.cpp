@@ -5,14 +5,39 @@
 #include <iostream>
 #include <string>
 #include <psapi.h>
+#include <d3d11.h>
 #include <vector>
+#include <cstdint>
+#include <unordered_set>
+#include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_win32.h"
+#include "imgui/backends/imgui_impl_dx11.h"
+
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 using namespace std;
 
-const unsigned int player_obj_value{5558412};
-struct Vector3{float x, y, z;};
-struct Vector2{float x, y;};
+const unsigned int PLAYER_OBJ_VALUE{5558412};
+struct Vector3
+{
+    float x, y, z;
+};
+struct Vector2
+{
+    float x, y;
+};
 
+ID3D11Device *g_device = nullptr;
+ID3D11DeviceContext *g_context = nullptr;
+IDXGISwapChain *g_swapChain = nullptr;
+ID3D11RenderTargetView *g_renderTarget = nullptr;
+
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 uintptr_t GetModuleBase(HANDLE hProcess, const wstring &modName)
 {
@@ -33,7 +58,6 @@ uintptr_t GetModuleBase(HANDLE hProcess, const wstring &modName)
     }
     return 0;
 }
-
 
 DWORD GetPID(const wstring &processName)
 {
@@ -58,7 +82,6 @@ DWORD GetPID(const wstring &processName)
     return pid;
 }
 
-
 uintptr_t find_ptr_to_dynamic_addr(
     uintptr_t struct_base_addr,
     uintptr_t *offsets,
@@ -81,8 +104,8 @@ uintptr_t find_ptr_to_dynamic_addr(
     return ptr;
 }
 
-
-bool WorldToScreen(Vector3 worldPos, Vector2 &screenPos, float *vm, int screenW, int screenH){
+bool WorldToScreen(Vector3 worldPos, Vector2 &screenPos, float *vm, int screenW, int screenH)
+{
     float clipX = worldPos.x * vm[0] + worldPos.y * vm[4] + worldPos.z * vm[8] + vm[12];
     float clipY = worldPos.x * vm[1] + worldPos.y * vm[5] + worldPos.z * vm[9] + vm[13];
     float clipW = worldPos.x * vm[3] + worldPos.y * vm[7] + worldPos.z * vm[11] + vm[15];
@@ -92,39 +115,61 @@ bool WorldToScreen(Vector3 worldPos, Vector2 &screenPos, float *vm, int screenW,
     float ndcY = clipY / clipW;
     screenPos.x = screenW / 2 + ndcX * screenW / 2;
     screenPos.y = screenH / 2 - ndcY * screenH / 2;
-    return true;}
-
-
-int players_count(
-    uintptr_t base,
-    uintptr_t *offsets,
-    HANDLE hprocess)
-{   
-    base += 0x00191FCC;
-    vector<uintptr_t> used_addr;
-    uintptr_t copied_offsets[2];
-    for(int counter{}; counter < 2; counter++){copied_offsets[counter] = offsets[counter];}
-    int result_count{}, value{};
-    while (true)
-    {
-        uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, copied_offsets, 2, hprocess);
-        if (
-            ReadProcessMemory(hprocess, (LPCVOID)dynamic_addr, &value, sizeof(value), NULL)
-            && value==player_obj_value
-            && find(used_addr.begin(), used_addr.end(), dynamic_addr) == used_addr.end()
-        ){
-            used_addr.push_back(dynamic_addr);
-            copied_offsets[0] += 0x4;
-            result_count++;
-        }
-        else break;
-    }
-    return result_count;
+    return true;
 }
 
-
-int main()
+void espbox(
+    HANDLE hprocess,
+    uintptr_t base,
+    ImDrawList *draw)
 {
+    float view_matrix[16];
+    ReadProcessMemory(hprocess, (LPCVOID)0x0057DFD0, &view_matrix, sizeof(view_matrix), NULL);
+    base += 0x00191FCC;
+    unordered_set<uintptr_t> used_addr;
+    uintptr_t offsets_entity_obj[2] = {0x0, 0xe8};
+    constexpr size_t MAX_NECESSARY_OFFSET = 0x30c + sizeof(int32_t);
+    uint8_t buffer[MAX_NECESSARY_OFFSET];
+    while (true)
+    {
+        uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, offsets_entity_obj, 2, hprocess);
+        uintptr_t entity_base = dynamic_addr - 0xe8;
+        if (
+            ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL) &&
+            *reinterpret_cast<int32_t *>(buffer + 0xe8) == PLAYER_OBJ_VALUE &&
+            !used_addr.count(dynamic_addr))
+        {
+            used_addr.insert(dynamic_addr);
+            offsets_entity_obj[0] += sizeof(int32_t);
+            Vector3 feet_pos = *reinterpret_cast<Vector3 *>(buffer + 0x4);
+            feet_pos.z -= 4.5f; // zabey
+            int32_t team_id = *reinterpret_cast<int32_t *>(buffer + 0x30c);
+            int32_t hp = *reinterpret_cast<int32_t *>(buffer + 0xe8 + 0x4);
+            Vector3 head_pos = {feet_pos.x, feet_pos.y, feet_pos.z + 5.2f};
+            Vector2 feet_screen, head_screen, screen_pos;
+            if ((hp >= 1 && hp <= 100) &&
+                team_id == 0 &&
+                WorldToScreen(feet_pos, feet_screen, view_matrix, 1920, 1080) &&
+                WorldToScreen(head_pos, head_screen, view_matrix, 1920, 1080))
+            {
+                float height = feet_screen.y - head_screen.y;
+                float width = height * 0.35f;
+
+                draw->AddRect(
+                    ImVec2(feet_screen.x - width / 2, head_screen.y),
+                    ImVec2(feet_screen.x + width / 2, feet_screen.y),
+                    IM_COL32(255, 0, 0, 255));
+            }
+        }
+        else
+            break;
+    }
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
+{
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
     string processName = "ac_client.exe";
     DWORD pid = GetPID(wstring(processName.begin(), processName.end()));
     if (pid != 0)
@@ -145,7 +190,109 @@ int main()
         return 1;
     }
     uintptr_t base = GetModuleBase(hprocess, L"ac_client.exe");
-    
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = L"MVP";
+    RegisterClassExW(&wc);
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST,
+        L"MVP", L"",
+        WS_POPUP,
+        0, 0,
+        GetSystemMetrics(SM_CXSCREEN),
+        GetSystemMetrics(SM_CYSCREEN),
+        nullptr, nullptr, hInst, nullptr);
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    D3D_FEATURE_LEVEL fl;
+    D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        nullptr, 0, D3D11_SDK_VERSION,
+        &sd, &g_swapChain, &g_device, &fl, &g_context);
+
+    ID3D11Texture2D *buf = nullptr;
+    g_swapChain->GetBuffer(0, IID_PPV_ARGS(&buf));
+    g_device->CreateRenderTargetView(buf, nullptr, &g_renderTarget);
+    buf->Release();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_device, g_context);
+
+    ShowWindow(hwnd, SW_SHOW);
+
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0,
+                 GetSystemMetrics(SM_CXSCREEN),
+                 GetSystemMetrics(SM_CYSCREEN),
+                 SWP_NOMOVE | SWP_NOSIZE);
+
+    bool running = true;
+    while (running)
+    {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+                running = false;
+        }
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        ImDrawList *draw = ImGui::GetForegroundDrawList();
+
+        espbox(hprocess, base, draw); // ********** my func
+
+        ImGui::Render();
+
+        float clear[4] = {0, 0, 0, 1};
+        g_context->OMSetRenderTargets(1, &g_renderTarget, nullptr);
+        g_context->ClearRenderTargetView(g_renderTarget, clear);
+
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_swapChain->Present(1, 0);
+    }
+
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    g_renderTarget->Release();
+    g_swapChain->Release();
+    g_context->Release();
+    g_device->Release();
+
+    DestroyWindow(hwnd);
     CloseHandle(hprocess);
     return 0;
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
