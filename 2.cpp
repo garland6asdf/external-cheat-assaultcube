@@ -20,7 +20,19 @@
 #pragma comment(lib, "dxgi.lib")
 
 using namespace std;
-
+namespace Offsets
+{
+    constexpr uintptr_t VIEW_MATRIX = 0x0057DFD0;
+    constexpr uintptr_t ENTITY_LIST = 0x00191FCC;
+    constexpr uintptr_t ENTITY_OFFSET = 0xE8;
+    constexpr uintptr_t TEAM_ID = 0x30C;
+    constexpr uintptr_t HEALTH = 0x4;
+    constexpr uintptr_t X_COORD = 0x4;
+}
+namespace TimeDelay
+{
+    constexpr int RESCAN_PLAYERS_ADDR_INTERVAL{30};
+}
 const unsigned int PLAYER_OBJ_VALUE{5558412};
 struct Vector3
 {
@@ -123,48 +135,74 @@ void espbox(
     uintptr_t base,
     ImDrawList *draw)
 {
+    base += Offsets::ENTITY_LIST;
+    static int frame_counter{};
+    static std::vector<uintptr_t> cached_entities;
     float view_matrix[16];
-    ReadProcessMemory(hprocess, (LPCVOID)0x0057DFD0, &view_matrix, sizeof(view_matrix), NULL);
-    base += 0x00191FCC;
-    unordered_set<uintptr_t> used_addr;
-    uintptr_t offsets_entity_obj[2] = {0x0, 0xe8};
-    constexpr size_t MAX_NECESSARY_OFFSET = 0x30c + sizeof(int32_t);
-    uint8_t buffer[MAX_NECESSARY_OFFSET];
-    while (true)
-    {
-        uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, offsets_entity_obj, 2, hprocess);
-        uintptr_t entity_base = dynamic_addr - 0xe8;
-        if (
-            ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL) &&
-            *reinterpret_cast<int32_t *>(buffer + 0xe8) == PLAYER_OBJ_VALUE &&
-            !used_addr.count(dynamic_addr))
-        {
-            used_addr.insert(dynamic_addr);
-            offsets_entity_obj[0] += sizeof(int32_t);
-            Vector3 feet_pos = *reinterpret_cast<Vector3 *>(buffer + 0x4);
-            feet_pos.z -= 4.5f; // zabey
-            int32_t team_id = *reinterpret_cast<int32_t *>(buffer + 0x30c);
-            int32_t hp = *reinterpret_cast<int32_t *>(buffer + 0xe8 + 0x4);
-            Vector3 head_pos = {feet_pos.x, feet_pos.y, feet_pos.z + 5.2f};
-            Vector2 feet_screen, head_screen, screen_pos;
-            if ((hp >= 1 && hp <= 100) &&
-                team_id == 0 &&
-                WorldToScreen(feet_pos, feet_screen, view_matrix, 1920, 1080) &&
-                WorldToScreen(head_pos, head_screen, view_matrix, 1920, 1080))
-            {
-                float height = feet_screen.y - head_screen.y;
-                float width = height * 0.35f;
+    ReadProcessMemory(hprocess, (LPCVOID)Offsets::VIEW_MATRIX, &view_matrix, sizeof(view_matrix), NULL);
 
-                draw->AddRect(
-                    ImVec2(feet_screen.x - width / 2, head_screen.y),
-                    ImVec2(feet_screen.x + width / 2, feet_screen.y),
-                    IM_COL32(255, 0, 0, 255));
+    constexpr size_t MAX_NECESSARY_OFFSET = Offsets::TEAM_ID + sizeof(int32_t);
+    uint8_t buffer[MAX_NECESSARY_OFFSET];
+
+    if (frame_counter % TimeDelay::RESCAN_PLAYERS_ADDR_INTERVAL == 0)
+    {
+        cached_entities.clear();
+        uintptr_t offsets_entity_obj[2] = {0x0, Offsets::ENTITY_OFFSET};
+        unordered_set<uintptr_t> used_addr;
+
+        while (true)
+        {
+            uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, offsets_entity_obj, 2, hprocess);
+            uintptr_t entity_base = dynamic_addr - Offsets::ENTITY_OFFSET;
+
+            if (
+                ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL) &&
+                *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET) == PLAYER_OBJ_VALUE &&
+                !used_addr.count(dynamic_addr))
+            {
+                used_addr.insert(dynamic_addr);
+                cached_entities.push_back(entity_base);
+                offsets_entity_obj[0] += sizeof(int32_t);
             }
+            else
+                break;
         }
-        else
-            break;
+    }
+    frame_counter++;
+    for (uintptr_t entity_base : cached_entities)
+    {
+        if (!ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL))
+            continue;
+
+        if (*reinterpret_cast<int32_t *>(buffer + 0xe8) != PLAYER_OBJ_VALUE)
+            continue;
+
+        Vector3 feet_pos = *reinterpret_cast<Vector3 *>(buffer + Offsets::X_COORD);
+        feet_pos.z -= 4.5f;
+        int32_t team_id = *reinterpret_cast<int32_t *>(buffer + Offsets::TEAM_ID);
+        int32_t hp = *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET + Offsets::HEALTH);
+        Vector3 head_pos = {feet_pos.x, feet_pos.y, feet_pos.z + 5.2f};
+        Vector2 feet_screen, head_screen;
+
+        if ((hp >= 1 && hp <= 100) &&
+            team_id == 1 &&
+            WorldToScreen(feet_pos, feet_screen, view_matrix, 1920, 1080) &&
+            WorldToScreen(head_pos, head_screen, view_matrix, 1920, 1080))
+        {
+            float height = feet_screen.y - head_screen.y;
+            float width = height * 0.35f;
+
+            draw->AddRect(
+                ImVec2(feet_screen.x - width / 2, head_screen.y),
+                ImVec2(feet_screen.x + width / 2, feet_screen.y),
+                IM_COL32(255, 0, 0, 255));
+        }
     }
 }
+
+
+void aimbot(){}
+
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
