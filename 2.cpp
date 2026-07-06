@@ -9,6 +9,10 @@
 #include <vector>
 #include <cstdint>
 #include <unordered_set>
+#include <optional>
+#include <cmath>
+#include <limits>
+
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
@@ -28,6 +32,7 @@ namespace Offsets
     constexpr uintptr_t TEAM_ID = 0x30C;
     constexpr uintptr_t HEALTH = 0x4;
     constexpr uintptr_t X_COORD = 0x4;
+
 }
 namespace TimeDelay
 {
@@ -116,18 +121,19 @@ uintptr_t find_ptr_to_dynamic_addr(
     return ptr;
 }
 
-bool WorldToScreen(Vector3 worldPos, Vector2 &screenPos, float *vm, int screenW, int screenH)
+optional<Vector2> WorldToScreen(Vector3 worldPos, float *vm, int screenW, int screenH)
 {
     float clipX = worldPos.x * vm[0] + worldPos.y * vm[4] + worldPos.z * vm[8] + vm[12];
     float clipY = worldPos.x * vm[1] + worldPos.y * vm[5] + worldPos.z * vm[9] + vm[13];
     float clipW = worldPos.x * vm[3] + worldPos.y * vm[7] + worldPos.z * vm[11] + vm[15];
     if (clipW < 0.1f)
-        return false;
+        return nullopt;
     float ndcX = clipX / clipW;
     float ndcY = clipY / clipW;
+    Vector2 screenPos;
     screenPos.x = screenW / 2 + ndcX * screenW / 2;
     screenPos.y = screenH / 2 - ndcY * screenH / 2;
-    return true;
+    return screenPos;
 }
 
 void espbox(
@@ -137,7 +143,7 @@ void espbox(
 {
     base += Offsets::ENTITY_LIST;
     static int frame_counter{};
-    static std::vector<uintptr_t> cached_entities;
+    unordered_set<uintptr_t> cached_entities;
     float view_matrix[16];
     ReadProcessMemory(hprocess, (LPCVOID)Offsets::VIEW_MATRIX, &view_matrix, sizeof(view_matrix), NULL);
 
@@ -146,10 +152,8 @@ void espbox(
 
     if (frame_counter % TimeDelay::RESCAN_PLAYERS_ADDR_INTERVAL == 0)
     {
-        cached_entities.clear();
         uintptr_t offsets_entity_obj[2] = {0x0, Offsets::ENTITY_OFFSET};
-        unordered_set<uintptr_t> used_addr;
-
+        cached_entities.clear();
         while (true)
         {
             uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, offsets_entity_obj, 2, hprocess);
@@ -158,10 +162,9 @@ void espbox(
             if (
                 ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL) &&
                 *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET) == PLAYER_OBJ_VALUE &&
-                !used_addr.count(dynamic_addr))
+                !cached_entities.count(entity_base))
             {
-                used_addr.insert(dynamic_addr);
-                cached_entities.push_back(entity_base);
+                cached_entities.insert(entity_base);
                 offsets_entity_obj[0] += sizeof(int32_t);
             }
             else
@@ -182,27 +185,69 @@ void espbox(
         int32_t team_id = *reinterpret_cast<int32_t *>(buffer + Offsets::TEAM_ID);
         int32_t hp = *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET + Offsets::HEALTH);
         Vector3 head_pos = {feet_pos.x, feet_pos.y, feet_pos.z + 5.2f};
-        Vector2 feet_screen, head_screen;
-
+        auto feet_screen = WorldToScreen(feet_pos, view_matrix, 1920, 1080);
+        auto head_screen = WorldToScreen(head_pos, view_matrix, 1920, 1080);
         if ((hp >= 1 && hp <= 100) &&
-            team_id == 1 &&
-            WorldToScreen(feet_pos, feet_screen, view_matrix, 1920, 1080) &&
-            WorldToScreen(head_pos, head_screen, view_matrix, 1920, 1080))
+            team_id == 0 &&
+            feet_screen &&
+            head_screen)
         {
-            float height = feet_screen.y - head_screen.y;
+            float height = feet_screen->y - head_screen->y;
             float width = height * 0.35f;
 
             draw->AddRect(
-                ImVec2(feet_screen.x - width / 2, head_screen.y),
-                ImVec2(feet_screen.x + width / 2, feet_screen.y),
+                ImVec2(feet_screen->x - width / 2, head_screen->y),
+                ImVec2(feet_screen->x + width / 2, feet_screen->y),
                 IM_COL32(255, 0, 0, 255));
         }
     }
 }
 
+void aimbot(HANDLE hprocess, uintptr_t base)
+{
+    base += Offsets::ENTITY_LIST;
+    uintptr_t offsets_entity_obj[2] = {0x0, Offsets::ENTITY_OFFSET};
+    double shortest_distance = numeric_limits<float>::max();
+    uintptr_t entity_w_shortest_distance = 0;
+    constexpr size_t MAX_NECESSARY_OFFSET = Offsets::TEAM_ID + sizeof(int32_t);
+    uint8_t buffer[MAX_NECESSARY_OFFSET];
+    float view_matrix[16];
+    ReadProcessMemory(hprocess, (LPCVOID)Offsets::VIEW_MATRIX, &view_matrix, sizeof(view_matrix), NULL);
+    while (true)
+    {
+        uintptr_t dynamic_addr = find_ptr_to_dynamic_addr(base, offsets_entity_obj, 2, hprocess);
+        uintptr_t entity_base = dynamic_addr - Offsets::ENTITY_OFFSET;
 
-void aimbot(){}
-
+        if (
+            ReadProcessMemory(hprocess, (LPCVOID)entity_base, &buffer, MAX_NECESSARY_OFFSET, NULL) &&
+            *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET) == PLAYER_OBJ_VALUE)
+        {
+            Vector3 feet_pos = *reinterpret_cast<Vector3 *>(buffer + Offsets::X_COORD);
+            feet_pos.z -= 4.5f;
+            int32_t team_id = *reinterpret_cast<int32_t *>(buffer + Offsets::TEAM_ID);
+            int32_t hp = *reinterpret_cast<int32_t *>(buffer + Offsets::ENTITY_OFFSET + Offsets::HEALTH);
+            Vector3 head_pos = {feet_pos.x, feet_pos.y, feet_pos.z + 5.2f};
+            auto head_screen = WorldToScreen(head_pos, view_matrix, 1920, 1080);
+            if (
+                head_screen &&
+                team_id == 0 &&
+                (hp >= 1 && hp <= 100))
+            {
+                double d_x = head_screen->x - 960.0;
+                double d_y = head_screen->y - 540.0;
+                double hypot_result = hypot(d_x, d_y);
+                if (hypot_result < shortest_distance)
+                {
+                    shortest_distance = hypot_result;
+                    entity_w_shortest_distance = entity_base;
+                }
+            }
+            offsets_entity_obj[0] += sizeof(int32_t);
+        }
+        else
+            break;
+    }
+}
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
 {
